@@ -1,0 +1,37 @@
+# 消融实验：无门控（禁用相位门控机制）
+
+model:
+  hidden_size: 400
+  num_heads: 8
+  head_dim: 50
+  num_layers: 12
+  vocab_size: 50257
+  ffn_size: 1550
+  dropout: 0.1
+
+hot:
+  alpha_init: 0.1
+  kappa_init: 0.05
+  temperature: 1.0
+  gating_epsilon: 1e-6
+  gate_position: "none"       # 禁用门控
+  ode_method: "midpoint"
+  annealing:
+    schedule: "cosine"
+    warmup_steps: 2000
+
+training:
+  batch_size: 16
+  gradient_accumulation: 2
+  max_steps: 100000
+  learning_rate: 3e-4
+  lr_schedule: "cosine"
+  warmup_steps: 2000
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  precision: "bf16"
+
+data:
+  dataset: "the_pile"
+  max_length: 2048
+  num_workers: 8

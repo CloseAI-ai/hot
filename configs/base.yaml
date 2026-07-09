@@ -1,0 +1,23 @@
+# 基础配置文件
+
+# 随机种子
+seed: 42
+
+# 日志配置
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# 检查点配置
+checkpoint:
+  save_dir: "checkpoints"
+  save_every: 1000
+  keep_last_n: 5
+
+# 评估配置
+evaluation:
+  eval_every: 500
+  eval_steps: 100
+
+# 设备配置
+device: "auto"  # 自动选择设备

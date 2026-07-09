@@ -1,0 +1,32 @@
+# HOT 项目依赖列表
+
+# 深度学习框架
+torch>=2.1.0
+
+# Hugging Face 生态
+transformers>=4.35.0
+datasets>=2.14.0
+tokenizers>=0.15.0
+
+# 实验追踪
+wandb>=0.16.0
+
+# 配置和工具
+pyyaml>=6.0
+
+# 可视化
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# 数值计算
+numpy>=1.24.0
+
+# 进度条
+tqdm>=4.65.0
+
+# 开发工具（可选）
+pytest>=7.4.0
+black>=23.0.0
+isort>=5.12.0
+flake8>=6.0.0
+mypy>=1.5.0

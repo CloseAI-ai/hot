@@ -105,58 +105,36 @@ hot/
 
 **文件**：`hot/model/phase_dynamics.py`
 
-**职责**：实现 Kuramoto ODE 的离散化求解器。
+**职责**：实现频率-相位解耦的相位更新。
 
 **接口设计**：
 
 ```python
 class PhaseDynamics(nn.Module):
     """
-    Kuramoto 相位动力学求解器
+    相位动力学：简单的 Euler 更新
     
-    实现 §2.2 的 ODE 方程：
-    dθ_i/dl = ω_i + κ Σ_j w_ij sin(θ_j - θ_i)
+    θ_i^(l+1) = θ_i^(l) + ω_i · Δt
+    
+    无耦合依赖，彻底消除循环依赖。
     """
     
     def __init__(self, config):
         super().__init__()
-        self.kappa = nn.Parameter(torch.tensor(config.kappa_init))
-        self.tau = config.temperature  # 耦合权重温度
+        self.dt = nn.Parameter(torch.tensor(1.0))  # 可学习时间步长
         
-    def compute_coupling_weights(self, prev_attention: Tensor) -> Tensor:
+    def forward(self, theta: Tensor, omega: Tensor) -> Tensor:
         """
-        从上一层注意力权重计算耦合权重 w_ij
-        w_ij = softmax_j(Â_ij / τ)
-        
-        Args:
-            prev_attention: [B, H, N, N] 上一层的注意力权重
-        Returns:
-            coupling: [B, H, N, N] 耦合权重矩阵
-        """
-        ...
-    
-    def compute_rhs(self, theta: Tensor, omega: Tensor, 
-                    coupling: Tensor) -> Tensor:
-        """
-        计算 ODE 右端项 f(θ)
-        f_i = ω_i + κ Σ_j w_ij sin(θ_j - θ_i)
-        
-        使用三角恒等式优化：
-        Σ_j w_ij sin(θ_j - θ_i) = sin(θ_i)(-Σ_j w_ij cos(θ_j)) 
-                                    + cos(θ_i)(Σ_j w_ij sin(θ_j))
+        相位更新（无耦合，纯频率驱动）
         
         Args:
             theta: [B, H, N] 当前相位
             omega: [B, H, N] 固有频率
-            coupling: [B, H, N, N] 耦合权重
         Returns:
-            d_theta: [B, H, N] 相位导数
+            theta_new: [B, H, N] 更新后的相位，归一化到 [0, 2π)
         """
-        ...
-    
-    def step_euler(self, theta, omega, coupling) -> Tensor:
-        """单步 Euler 更新"""
-        ...
+        theta_new = (theta + omega * self.dt) % (2 * math.pi)
+        return theta_new
     
     def step_midpoint(self, theta, omega, coupling) -> Tensor:
         """中点法更新（默认）"""
@@ -221,42 +199,28 @@ class PhaseGating(nn.Module):
         """
         ...
     
-    def gating_function(self, delta_theta: Tensor) -> Tensor:
-        """
-        门控函数 Φ(Δθ) = ReLU(cos(Δθ)) + ε
-        
-        Args:
-            delta_theta: [B, H, N, N] 相位差
-        Returns:
-            gate: [B, H, N, N] 门控值，范围 [ε, 1+ε]
-        """
-        return F.relu(torch.cos(delta_theta)) + self.epsilon
-    
     def forward(self, attn_scores: Tensor, theta: Tensor) -> Tensor:
         """
-        将门控应用到注意力分数
+        残差耦合门控：在 logit 空间加性调制
+        
+        Score_ij = Q·K/√d + α·cos(θ_i - θ_j)
         
         Args:
             attn_scores: [B, H, N, N] Q·K/√d 注意力分数
             theta: [B, H, N] 当前相位
         Returns:
-            gated_scores: [B, H, N, N] 门控后的注意力分数
+            gated_scores: [B, H, N, N] 调制后的注意力分数（未 softmax）
         """
-        delta_theta = self.compute_phase_matrix(theta)
-        gate = self.gating_function(delta_theta)
-        
-        if self.gate_position == 'pre_softmax':
-            return attn_scores * gate
-        else:  # post_softmax
-            attn_weights = F.softmax(attn_scores, dim=-1)
-            return attn_weights * gate
+        delta_theta = theta.unsqueeze(-1) - theta.unsqueeze(-2)
+        alpha = F.softplus(self.alpha)
+        return attn_scores + alpha * torch.cos(delta_theta)
 ```
 
 **单元测试**：
-- `test_gate_at_zero`：$\Delta\theta = 0$ 时 $\Phi = 1 + \epsilon$
-- `test_gate_at_pi_half`：$\Delta\theta = \pi/2$ 时 $\Phi = \epsilon$
-- `test_gate_gradient`：验证梯度在 $\Delta\theta \approx \pi/4$ 处最大
-- `test_gate_range`：验证 $\Phi \in [\epsilon, 1+\epsilon]$
+- `test_synchronized_phase`：同相时 cos(0)=1，logit 增加
+- `test_opposite_phase`：反相时 cos(π)=-1，logit 减少但不归零
+- `test_content_preserved`：softmax 后所有权重 > 0
+- `test_alpha_gradient`：α 可正常接收梯度
 
 ---
 
@@ -264,21 +228,21 @@ class PhaseGating(nn.Module):
 
 **文件**：`hot/model/frequency.py`
 
-**职责**：实现 §2.1 的频率计算。
+**职责**：实现能量差形式的频率计算。
 
 ```python
 class IntrinsicFrequency(nn.Module):
     """
     Token 固有频率计算
     
-    实现 §2.1：
-    ω_i = tanh(α · (Q_i^(1)·K_i^(1) - Q_i^(2)·K_i^(2)))
+    ω_i = tanh(Linear(||Q_i||² - ||K_i||²))
+    
+    频率由 Q/K 能量差决定，表征 Token 的"内在节拍"。
     """
     
     def __init__(self, config):
         super().__init__()
-        self.alpha = nn.Parameter(torch.tensor(config.alpha_init))  # 默认 0.1
-        self.head_dim = config.head_dim
+        self.proj = nn.Linear(1, num_heads)  # 标量 → 每头频率
         
     def forward(self, Q: Tensor, K: Tensor) -> Tensor:
         """
