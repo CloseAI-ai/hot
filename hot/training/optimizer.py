@@ -35,11 +35,22 @@ def configure_optimizer(model: torch.nn.Module, config: Dict[str, Any]) -> AdamW
         {'params': no_decay_params, 'weight_decay': 0.0},
     ]
 
-    optimizer = AdamW(
-        param_groups,
-        lr=config.get('learning_rate', 3e-4),
-        betas=(0.9, 0.999),
-        eps=1e-8,
-    )
+    # 使用 fused AdamW（CUDA 加速，减少 kernel launch 开销）
+    try:
+        optimizer = AdamW(
+            param_groups,
+            lr=config.get('learning_rate', 3e-4),
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            fused=True,
+        )
+    except TypeError:
+        # 旧版 PyTorch 不支持 fused 参数
+        optimizer = AdamW(
+            param_groups,
+            lr=config.get('learning_rate', 3e-4),
+            betas=(0.9, 0.999),
+            eps=1e-8,
+        )
 
     return optimizer

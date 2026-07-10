@@ -24,10 +24,15 @@ class TestForward:
     def test_without_labels(self, model, config):
         B, N = 2, 64
         input_ids = torch.randint(0, config['model']['vocab_size'], (B, N))
-        outputs = model(input_ids=input_ids)
 
+        # 默认不返回详细信息（节省内存）
+        outputs = model(input_ids=input_ids)
         assert outputs['logits'].shape == (B, N, config['model']['vocab_size'])
         assert outputs['loss'] is None
+        assert 'thetas' not in outputs  # 默认不返回
+
+        # 使用 return_details=True 获取详细信息
+        outputs = model(input_ids=input_ids, return_details=True)
         assert len(outputs['thetas']) == config['model']['num_layers']
         assert len(outputs['attentions']) == config['model']['num_layers']
 
@@ -90,7 +95,7 @@ class TestNoCircularDependency:
     def test_phase_propagates_through_layers(self, model, config):
         """相位跨层传递，每层独立更新"""
         input_ids = torch.randint(0, config['model']['vocab_size'], (1, 16))
-        outputs = model(input_ids=input_ids)
+        outputs = model(input_ids=input_ids, return_details=True)
 
         # 各层相位应不同（因为每层独立更新）
         thetas = outputs['thetas']
@@ -102,22 +107,13 @@ class TestAnnealingIntegration:
     """测试退火调度集成"""
 
     def test_annealing_affects_output(self, model, config):
-        from hot.training import ProgressivePhaseAnnealing
-
         input_ids = torch.randint(0, config['model']['vocab_size'], (1, 32))
 
-        # 无退火
-        model.annealing_schedule = None
-        out1 = model(input_ids=input_ids)
+        # beta=0（冻结期）
+        out_beta0 = model(input_ids=input_ids, beta=0.0)
 
-        # 退火冻结期（beta=0）
-        model.annealing_schedule = ProgressivePhaseAnnealing(2000, 'cosine')
-        model.global_step = 0
-        out2 = model(input_ids=input_ids)
+        # beta=1（退火完成期）
+        out_beta1 = model(input_ids=input_ids, beta=1.0)
 
-        # 退火完成期（beta≈1）
-        model.global_step = 10000
-        out3 = model(input_ids=input_ids)
-
-        # beta=0 和 beta≈1 应产生不同输出
-        assert not torch.allclose(out2['logits'], out3['logits'], atol=1e-3)
+        # beta=0 和 beta=1 应产生不同输出
+        assert not torch.allclose(out_beta0['logits'], out_beta1['logits'], atol=1e-3)

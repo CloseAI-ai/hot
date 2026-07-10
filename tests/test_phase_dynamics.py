@@ -106,30 +106,39 @@ class TestForward:
         assert pd.dt.grad is not None
 
 
+def _cop(theta):
+    """辅助函数：从 theta 计算 cos/sin/pos 并调用 causal_order_parameter"""
+    cos_t = torch.cos(theta)
+    sin_t = torch.sin(theta)
+    N = theta.shape[-1]
+    pos = torch.arange(1, N + 1, device=theta.device, dtype=theta.dtype)
+    return causal_order_parameter(cos_t, sin_t, pos)
+
+
 class TestCausalOrderParameter:
     """测试因果序参量"""
 
     def test_output_shape(self):
         theta = torch.rand(2, 4, 8) * 2 * math.pi
-        r = causal_order_parameter(theta)
+        r = _cop(theta)
         assert r.shape == (2, 8)
 
     def test_range(self):
         theta = torch.rand(2, 4, 16) * 2 * math.pi
-        r = causal_order_parameter(theta)
+        r = _cop(theta)
         assert (r >= 0).all()
         assert (r <= 1 + 1e-5).all()
 
     def test_synchronized_phase(self):
         """所有 token 同相时 r = 1"""
         theta = torch.ones(1, 4, 8) * 1.5  # 所有相位相同
-        r = causal_order_parameter(theta)
+        r = _cop(theta)
         assert torch.allclose(r, torch.ones_like(r), atol=1e-5)
 
     def test_first_token_is_one(self):
         """第一个 token 的序参量恒为 1（只有一个 token）"""
         theta = torch.rand(2, 4, 1) * 2 * math.pi
-        r = causal_order_parameter(theta)
+        r = _cop(theta)
         assert torch.allclose(r, torch.ones_like(r), atol=1e-5)
 
     def test_causal_property(self):
@@ -137,13 +146,13 @@ class TestCausalOrderParameter:
         B, H, N = 1, 1, 4
         theta = torch.rand(B, H, N) * 2 * math.pi
 
-        r_full = causal_order_parameter(theta)
+        r_full = _cop(theta)
 
         # 修改最后一个 token 的相位
         theta_modified = theta.clone()
         theta_modified[0, 0, -1] = theta[0, 0, -1] + math.pi
 
-        r_modified = causal_order_parameter(theta_modified)
+        r_modified = _cop(theta_modified)
 
         # 前 N-1 个 token 的 r 应该相同
         assert torch.allclose(r_full[0, :N-1], r_modified[0, :N-1], atol=1e-5)
@@ -154,13 +163,13 @@ class TestCausalOrderParameter:
         """随机相位的序参量应小于 1"""
         torch.manual_seed(42)
         theta = torch.rand(1, 1, 100) * 2 * math.pi
-        r = causal_order_parameter(theta)
+        r = _cop(theta)
         # 大量随机相位时，序参量应显著小于 1
         assert r[0, -1] < 0.5
 
     def test_gradient_flow(self):
         theta = torch.rand(1, 2, 4) * 2 * math.pi
         theta.requires_grad_(True)
-        r = causal_order_parameter(theta)
+        r = _cop(theta)
         r.sum().backward()
         assert theta.grad is not None

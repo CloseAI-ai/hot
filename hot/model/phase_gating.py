@@ -6,9 +6,7 @@
 Score_ij = Q·K/√d + α·cos(θ_i - θ_j)
 attn_weights = softmax(Score_ij)
 
-- α 是可学习标量，初始化为 0.1
-- 当 α=0 退化为标准注意力
-- cos(Δθ) 在 logit 空间做加性偏置，永远不会"关闭"内容注意力
+优化：接收预计算的 sin/cos，避免重复 trig 计算。
 """
 
 import torch
@@ -21,9 +19,9 @@ class PhaseGating(nn.Module):
 
     在 logit 空间加性调制：Score += α·cos(θ_i - θ_j)
 
-    - 同相（cos=+1）：增强注意力 → 语义节律同步的 token 更受关注
-    - 反相（cos=-1）：削弱注意力，但不归零 → 内容信息始终保留
-    - α=0：退化为标准 Transformer
+    - α 是可学习标量，初始化为 0.1
+    - 当 α=0 退化为标准注意力
+    - cos(Δθ) 在 logit 空间做加性偏置，永远不会"关闭"内容注意力
     """
 
     def __init__(self, config):
@@ -36,28 +34,35 @@ class PhaseGating(nn.Module):
             self.gate_position = config.hot.gate_position
             alpha_init = config.hot.alpha_init
 
-        # 可学习的耦合强度，初始化为小值
+        # 可学习的耦合强度
         self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
 
-    def forward(self, attn_scores: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+    def forward(self, attn_scores: torch.Tensor,
+                cos_theta: torch.Tensor, sin_theta: torch.Tensor) -> torch.Tensor:
         """
         残差耦合门控
 
         Args:
             attn_scores: [B, H, N, N] Q·K/√d 注意力分数
-            theta: [B, H, N] 当前相位
+            cos_theta: [B, H, N] 预计算的 cos(θ)
+            sin_theta: [B, H, N] 预计算的 sin(θ)
         Returns:
             gated_scores: [B, H, N, N] 调制后的注意力分数（未 softmax）
         """
         if self.gate_position == 'none':
             return attn_scores
 
-        # 相位差矩阵：Δθ_ij = θ_i - θ_j
-        delta_theta = theta.unsqueeze(-1) - theta.unsqueeze(-2)
-
-        # 残差耦合：在 logit 空间加性调制
-        # α 使用 softplus 确保非负（调制强度 ≥ 0）
+        # 使用 softplus 确保 α 非负，并 clamp 防止过大
         alpha = torch.nn.functional.softplus(self.alpha)
-        gated_scores = attn_scores + alpha * torch.cos(delta_theta)
+        alpha = torch.clamp(alpha, max=5.0)
 
-        return gated_scores
+        # cos(θ_i - θ_j) = cos(θ_i)cos(θ_j) + sin(θ_i)sin(θ_j)
+        # 外积计算：[B, H, N, 1] * [B, H, 1, N] → [B, H, N, N]
+        cos_delta = (cos_theta.unsqueeze(-1) * cos_theta.unsqueeze(-2) +
+                     sin_theta.unsqueeze(-1) * sin_theta.unsqueeze(-2))
+
+        # clamp 到 [-1, 1] 防止浮点误差累积
+        cos_delta = torch.clamp(cos_delta, -1.0, 1.0)
+
+        # 残差耦合：attn_scores += α * cos(Δθ)
+        return attn_scores + alpha * cos_delta

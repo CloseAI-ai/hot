@@ -11,6 +11,11 @@ def make_config(gate_position='pre_softmax', alpha_init=0.1):
     return {'hot': {'gate_position': gate_position, 'alpha_init': alpha_init}}
 
 
+def _prep(theta):
+    """预计算 sin/cos，与模型行为一致"""
+    return torch.cos(theta), torch.sin(theta)
+
+
 @pytest.fixture
 def pg():
     return PhaseGating(make_config())
@@ -35,8 +40,9 @@ class TestResidualCoupling:
         B, H, N = 1, 1, 4
         scores = torch.zeros(B, H, N, N)
         theta = torch.ones(B, H, N) * 1.5  # 所有 token 同相
+        cos_t, sin_t = _prep(theta)
 
-        result = pg(scores, theta)
+        result = pg(scores, cos_t, sin_t)
         # 残差耦合：scores + softplus(α)·cos(0) = 0 + softplus(0.1)·1 > 0
         assert (result > 0).all()
 
@@ -45,8 +51,9 @@ class TestResidualCoupling:
         B, H, N = 1, 1, 2
         scores = torch.zeros(B, H, N, N)
         theta = torch.tensor([[[0.0, math.pi]]])
+        cos_t, sin_t = _prep(theta)
 
-        result = pg(scores, theta)
+        result = pg(scores, cos_t, sin_t)
         # 对角线 cos(0)=1 → 正 logit
         # 跨对角线 cos(π)=-1 → 负 logit
         assert result[0, 0, 0, 0] > 0  # cos(0)
@@ -60,33 +67,28 @@ class TestResidualCoupling:
         pg = PhaseGating(make_config(alpha_init=0.0))
         scores = torch.randn(1, 1, 4, 4)
         theta = torch.rand(1, 1, 4) * 2 * math.pi
+        cos_t, sin_t = _prep(theta)
 
-        result = pg(scores, theta)
-        # softplus(0) = log(2) ≈ 0.693，不是 0
-        # 但 α_init=0 时 softplus(0) ≈ 0.693
-        # 让我们测试 α 被显式设为很大的负数时 softplus → 0
+        result = pg(scores, cos_t, sin_t)
         pg.alpha.data.fill_(-10.0)
-        result = pg(scores, theta)
+        result = pg(scores, cos_t, sin_t)
         assert torch.allclose(result, scores, atol=1e-4)
 
     def test_content_attention_preserved(self):
         """即使 cos(Δθ)=-1，softmax 后内容注意力仍保留"""
         pg = PhaseGating(make_config(alpha_init=1.0))
         B, H, N = 1, 1, 4
-        # 设置一个有显著差异的 scores
         scores = torch.tensor([[[[2.0, 1.0, 0.5, 0.1],
                                   [1.0, 2.0, 0.5, 0.1],
                                   [0.5, 0.5, 2.0, 1.0],
                                   [0.1, 0.1, 1.0, 2.0]]]])
-        # 极端反相
         theta = torch.tensor([[[0.0, 0.0, math.pi, math.pi]]])
+        cos_t, sin_t = _prep(theta)
 
-        result = pg(scores, theta)
+        result = pg(scores, cos_t, sin_t)
         weights = torch.softmax(result, dim=-1)
 
-        # 所有权重 > 0（内容注意力不丢失）
         assert (weights > 0).all()
-        # 每行和为 1
         assert torch.allclose(weights.sum(-1), torch.ones(1, 1, 1), atol=1e-5)
 
 
@@ -97,14 +99,16 @@ class TestForwardShapes:
         B, H, N = 2, 4, 8
         scores = torch.randn(B, H, N, N)
         theta = torch.rand(B, H, N) * 2 * math.pi
-        result = pg(scores, theta)
+        cos_t, sin_t = _prep(theta)
+        result = pg(scores, cos_t, sin_t)
         assert result.shape == (B, H, N, N)
 
     def test_none_gate(self):
         pg = PhaseGating(make_config('none'))
         scores = torch.randn(2, 4, 8, 8)
         theta = torch.rand(2, 4, 8) * 2 * math.pi
-        result = pg(scores, theta)
+        cos_t, sin_t = _prep(theta)
+        result = pg(scores, cos_t, sin_t)
         assert torch.equal(result, scores)
 
 
@@ -114,7 +118,8 @@ class TestGradientFlow:
     def test_alpha_receives_gradient(self, pg):
         scores = torch.randn(1, 2, 4, 4)
         theta = torch.rand(1, 2, 4) * 2 * math.pi
-        result = pg(scores, theta)
+        cos_t, sin_t = _prep(theta)
+        result = pg(scores, cos_t, sin_t)
         result.sum().backward()
         assert pg.alpha.grad is not None
 
@@ -122,6 +127,8 @@ class TestGradientFlow:
         scores = torch.randn(1, 2, 4, 4)
         theta = torch.rand(1, 2, 4) * 2 * math.pi
         theta.requires_grad_(True)
-        result = pg(scores, theta)
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
+        result = pg(scores, cos_t, sin_t)
         result.sum().backward()
         assert theta.grad is not None

@@ -2,6 +2,11 @@
 HOT 层模块
 
 整合频率-相位解耦动力学、相位门控和注意力计算。
+
+优化：
+- 共享 sin/cos 计算（phase_gating + causal_order_parameter 共用）
+- 预计算 position 索引（注册为 buffer）
+- 使用 F.scaled_dot_product_attention（自动选择 FlashAttention）
 """
 
 import torch
@@ -15,7 +20,7 @@ from .frequency import IntrinsicFrequency
 
 
 class MultiHeadAttention(nn.Module):
-    """标准多头注意力"""
+    """标准多头注意力（使用原生 SDPA）"""
 
     def __init__(self, config):
         super().__init__()
@@ -42,11 +47,6 @@ class MultiHeadAttention(nn.Module):
         V = self.v_proj(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         return Q, K, V
 
-    def compute_scores(self, Q: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
-        """计算注意力分数 Q·K/√d"""
-        scale = self.head_dim ** -0.5
-        return torch.matmul(Q, K.transpose(-2, -1)) * scale
-
     def compute_output(self, attn_weights: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
         """计算注意力输出并投影"""
         B, H, N, D = (attn_weights @ V).shape
@@ -55,7 +55,7 @@ class MultiHeadAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    """前馈网络（SwiGLU 风格的两层 FFN）"""
+    """前馈网络"""
 
     def __init__(self, config):
         super().__init__()
@@ -88,29 +88,34 @@ class RMSNorm(nn.Module):
         return x * norm * self.weight
 
 
-def causal_order_parameter(theta: torch.Tensor) -> torch.Tensor:
+def causal_order_parameter(cos_theta: torch.Tensor, sin_theta: torch.Tensor,
+                           pos: torch.Tensor) -> torch.Tensor:
     """
     因果序参量：仅使用当前位置及之前的相位信息
 
     r_i = |1/i Σ_{j=1}^{i} exp(iθ_j)|
 
+    使用纯实数运算（bf16 兼容）：
+    - cos 累积和：C_i = Σ_{j<=i} cos(θ_j)
+    - sin 累积和：S_i = Σ_{j<=i} sin(θ_j)
+    - r_i = sqrt(C_i² + S_i²) / i
+
     Args:
-        theta: [B, H, N] 相位
+        cos_theta: [B, H, N] 预计算的 cos(θ)
+        sin_theta: [B, H, N] 预计算的 sin(θ)
+        pos: [N] 预计算的位置索引 [1, 2, ..., N]
     Returns:
         r: [B, N] 因果序参量，范围 [0, 1]，对 head 取平均
     """
-    # exp(iθ) → 复数表示
-    z = torch.exp(1j * theta)  # [B, H, N] complex
+    # 因果累积和
+    cos_cumsum = cos_theta.cumsum(dim=-1)  # [B, H, N]
+    sin_cumsum = sin_theta.cumsum(dim=-1)  # [B, H, N]
 
-    # 因果累积和：S_i = Σ_{j=1}^{i} z_j
-    S = z.cumsum(dim=-1)  # [B, H, N] complex
-
-    # 位置索引：[1, 2, ..., N]
-    N = theta.shape[-1]
-    pos = torch.arange(1, N + 1, device=theta.device, dtype=torch.float32)  # [N]
-
-    # r_i = |S_i / i|
-    r = (S.abs() / pos)  # [B, H, N]
+    # r_i = sqrt(C_i² + S_i²) / i
+    # 添加 eps 防止 sqrt(0) 和除零的数值问题
+    r_sq = cos_cumsum.pow(2) + sin_cumsum.pow(2)
+    r = torch.sqrt(r_sq + 1e-8) / (pos + 1e-8)  # [B, H, N]
+    r = torch.clamp(r, max=1.0)  # r 理论上 ∈ [0,1]，clamp 防止浮点溢出
 
     # 对 head 取平均 → [B, N]
     return r.mean(dim=1)
@@ -152,12 +157,14 @@ class HOTLayer(nn.Module):
         self.gamma = nn.Parameter(torch.zeros(1))
 
     def forward(self, x: torch.Tensor, theta: torch.Tensor,
-                annealing_beta: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                annealing_beta: float = 1.0,
+                pos: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             x: [B, N, D] 隐藏状态
             theta: [B, H, N] 当前相位
             annealing_beta: 退火系数 β ∈ [0, 1]
+            pos: [N] 预计算的位置索引
         Returns:
             x_new: [B, N, D] 更新后的隐藏状态
             theta_new: [B, H, N] 更新后的相位
@@ -174,30 +181,41 @@ class HOTLayer(nn.Module):
         # 3. 更新相位（跨层传递，无耦合依赖）
         theta_new = self.phase_dynamics(theta, omega)  # [B, H, N]
 
-        # 4. 注意力分数 + 残差耦合相位门控
-        attn_scores = self.attn.compute_scores(Q, K)  # [B, H, N, N]
+        # 从 theta_new 计算 sin/cos（确保梯度流经 frequency → omega → theta_new）
+        cos_theta = torch.cos(theta_new)
+        sin_theta = torch.sin(theta_new)
 
+        # 4. 注意力 + 相位门控（统一使用 SDPA + attn_mask）
         if self.phase_gating.gate_position == 'none' or annealing_beta == 0.0:
-            attn_weights = F.softmax(attn_scores, dim=-1)
+            # 纯标准注意力，使用原生 SDPA（自动选择 FlashAttention）
+            attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
         else:
-            gated_scores = self.phase_gating(attn_scores, theta_new)
+            # 构建 attn_mask = 因果mask + β·α·cos(Δθ)
+            alpha = torch.nn.functional.softplus(self.phase_gating.alpha)
+            alpha = torch.clamp(alpha, max=5.0)
 
-            if annealing_beta < 1.0:
-                gated_scores = (1 - annealing_beta) * attn_scores + annealing_beta * gated_scores
+            cos_delta = (cos_theta.unsqueeze(-1) * cos_theta.unsqueeze(-2) +
+                         sin_theta.unsqueeze(-1) * sin_theta.unsqueeze(-2))
+            cos_delta = torch.clamp(cos_delta, -1.0, 1.0)
 
-            attn_weights = F.softmax(gated_scores, dim=-1)
+            N = Q.shape[2]
+            causal_mask = torch.triu(torch.full((N, N), float('-inf'),
+                                                device=Q.device, dtype=Q.dtype), diagonal=1)
+            attn_mask = causal_mask + annealing_beta * alpha * cos_delta
 
-        attn_out = self.attn.compute_output(attn_weights, V)
+            attn_out = F.scaled_dot_product_attention(Q, K, V, attn_mask=attn_mask)
+
+        B, H, N, D = attn_out.shape
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, N, H * D)
+        attn_out = self.attn.o_proj(attn_out)
 
         # 5. 因果序参量 → 相位感知残差缩放
-        # r_i = |1/i Σ_{j≤i} exp(iθ_j)|  （因果，不泄露未来信息）
-        # s_i = 1 + γ·(1 - r_i)           （相位越分散，残差越强）
-        r = causal_order_parameter(theta_new)  # [B, N]
-        scale = 1.0 + self.gamma * (1.0 - r)  # [B, N]
-        scale = scale.unsqueeze(-1)  # [B, N, 1]，广播到 [B, N, D]
+        r = causal_order_parameter(cos_theta, sin_theta, pos)  # [B, N]
+        scale_val = 1.0 + self.gamma * (1.0 - r)  # [B, N]
+        scale_val = scale_val.unsqueeze(-1)  # [B, N, 1]
 
         # 6. 缩放残差 + 注意力输出 + FFN
-        x = scale * residual + attn_out
+        x = scale_val * residual + attn_out
         x = x + self.ffn(self.norm2(x))
 
-        return x, theta_new, attn_weights
+        return x, theta_new, None

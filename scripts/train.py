@@ -4,7 +4,8 @@ HOT 训练脚本
 
 用法：
     python scripts/train.py --config configs/hot_42m.yaml
-    python scripts/train.py --config configs/hot_42m.yaml --device cuda:0 --use_wandb
+    python scripts/train.py --config configs/hot_42m.yaml --resume checkpoints/latest.pt
+    python scripts/train.py --config configs/hot_42m.yaml --pretokenize  # 预分词数据集
 """
 
 import argparse
@@ -13,9 +14,15 @@ import yaml
 import torch
 from torch.utils.data import DataLoader
 
+# 启用 TF32（RTX 30/40 系列 Tensor Core 加速）
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision('high')
+
 from hot.model import HOTModel
 from hot.training import Trainer
-from hot.data import HOTDataset, get_tokenizer, DataCollator
+from hot.data import HOTDataset, get_tokenizer, DataCollator, pretokenize_dataset
 
 
 def _convert_numeric_strings(obj):
@@ -65,6 +72,10 @@ def main():
                         help='覆盖最大训练步数')
     parser.add_argument('--batch_size', type=int, default=None,
                         help='覆盖 batch size')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='从检查点恢复训练（如 checkpoints/latest.pt）')
+    parser.add_argument('--pretokenize', action='store_true',
+                        help='预分词数据集并保存')
     args = parser.parse_args()
 
     # 加载配置
@@ -103,26 +114,59 @@ def main():
     # 分词器
     tokenizer = get_tokenizer()
 
-    # 数据集
+    # 数据集配置
     data_cfg = config.get('data', {})
+    train_cfg = config.get('training', {})
+    max_length = int(data_cfg.get('max_length', 512))
+
+    # 设置 HF 镜像环境变量
+    import os
+    os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
+
+    # 预分词模式
+    if args.pretokenize:
+        pretokenize_dataset(
+            dataset_name=data_cfg.get('dataset', 'RobinChen2001/TinyStories-Zh-2M'),
+            tokenizer=tokenizer,
+            max_length=max_length,
+            split='train',
+            hf_token=data_cfg.get('hf_token'),
+            cache_dir=data_cfg.get('cache_dir'),
+            save_path=f"data/tokenized/train_{max_length}",
+            num_proc=4,
+        )
+        logging.info("预分词完成！")
+        return
+
+    # 检查是否有预分词数据
+    pretokenized_path = f"data/tokenized/train_{max_length}"
+
     train_dataset = HOTDataset(
-        dataset_name=data_cfg.get('dataset', 'the_pile'),
+        dataset_name=data_cfg.get('dataset', 'RobinChen2001/TinyStories-Zh-2M'),
         tokenizer=tokenizer,
-        max_length=data_cfg.get('max_length', 2048),
+        max_length=max_length,
         split='train',
+        hf_token=data_cfg.get('hf_token'),
+        cache_dir=data_cfg.get('cache_dir'),
+        pretokenized_path=pretokenized_path if os.path.exists(pretokenized_path) else None,
     )
 
     collator = DataCollator(pad_token_id=tokenizer.pad_token_id)
-    train_cfg = config.get('training', {})
 
+    # DataLoader 优化：预分词数据用 num_workers=0 避免 IPC 开销
+    num_workers = data_cfg.get('num_workers', 4)
+    use_pretokenized = os.path.exists(pretokenized_path)
+    dl_workers = 0 if use_pretokenized else num_workers
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=train_cfg.get('batch_size', 16),
+        batch_size=int(train_cfg.get('batch_size', 16)),
         shuffle=True,
         collate_fn=collator,
-        num_workers=data_cfg.get('num_workers', 4),
-        pin_memory=True,
+        num_workers=dl_workers,
+        pin_memory=dl_workers > 0,
         drop_last=True,
+        persistent_workers=dl_workers > 0,
+        prefetch_factor=4 if dl_workers > 0 else None,
     )
 
     # 模型
@@ -132,6 +176,11 @@ def main():
 
     # 训练器
     trainer = Trainer(model, config)
+
+    # 断点续传
+    if args.resume:
+        trainer.resume(args.resume)
+        logging.info(f"从检查点恢复: step={trainer.global_step}")
 
     # 训练
     logging.info("开始训练...")

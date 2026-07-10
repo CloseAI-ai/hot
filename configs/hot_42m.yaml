@@ -24,8 +24,8 @@ hot:
 
 # 训练配置
 training:
-  batch_size: 16
-  gradient_accumulation: 2     # 有效 batch = 32
+  batch_size: 8
+  gradient_accumulation: 4     # 有效 batch = 32
   max_steps: 100000
   learning_rate: 3e-4
   lr_schedule: "cosine"
@@ -33,9 +33,13 @@ training:
   weight_decay: 0.1
   max_grad_norm: 1.0
   precision: "bf16"
+  compile: true                # 启用 torch.compile
+  compile_mode: "default"      # 编译模式（default 最快）
 
 # 数据配置
 data:
-  dataset: "the_pile"
-  max_length: 2048
-  num_workers: 8
+  dataset: "RobinChen2001/TinyStories-Zh-2M"
+  max_length: 512
+  num_workers: 4
+  hf_token: ""  # Set via HF_TOKEN environment variable
+  cache_dir: "data/raw"
