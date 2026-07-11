@@ -14,6 +14,12 @@ def config():
 
 
 @pytest.fixture
+def config_8m():
+    with open('configs/hot_8m.yaml', 'r') as f:
+        return yaml.safe_load(f)
+
+
+@pytest.fixture
 def model(config):
     return HOTModel(config)
 
@@ -56,6 +62,11 @@ class TestParameterCount:
     def test_approximately_42m(self, model):
         total = sum(p.numel() for p in model.parameters())
         assert 35e6 < total < 55e6, f"参数量 {total / 1e6:.2f}M 不在预期范围"
+
+    def test_approximately_8m(self, config_8m):
+        model = HOTModel(config_8m)
+        total = sum(p.numel() for p in model.parameters())
+        assert 7e6 < total < 10e6, f"参数量 {total / 1e6:.2f}M 不在预期范围"
 
     def test_weight_tying(self, model):
         assert model.embed.weight is model.lm_head.weight

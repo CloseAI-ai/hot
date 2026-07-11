@@ -1,13 +1,13 @@
-# HOT 42M 配置文件
+# HOT ~8M 配置文件
 
 # 模型配置
 model:
-  hidden_size: 400
+  hidden_size: 128
   num_heads: 8
-  head_dim: 50
-  num_layers: 12
+  head_dim: 16
+  num_layers: 6
   vocab_size: 50257
-  ffn_size: 1550
+  ffn_size: 512
   dropout: 0.1
 
 # HOT 特定配置
@@ -24,10 +24,10 @@ hot:
 
 # 训练配置
 training:
-  batch_size: 16               # 2 的幂次，GPU 更高效
-  gradient_accumulation: 3     # 有效 batch = 48
+  batch_size: 24               # 8GB 显存，留余量给激活值和编译缓存
+  gradient_accumulation: 2     # 有效 batch = 48
   max_steps: 100000
-  learning_rate: 3e-4
+  learning_rate: 4.5e-4         # 按 effective batch 32→48 线性缩放 (3e-4 × 1.5)
   lr_schedule: "cosine"
   warmup_steps: 2000
   weight_decay: 0.1
@@ -37,10 +37,16 @@ training:
   compile_mode: "default"      # 编译模式
   gradient_checkpointing: false # 梯度检查点与 FlexAttention 不兼容
 
+# 评估配置
+evaluation:
+  eval_every: 500              # 每 500 步评估一次
+  eval_steps: 50               # 评估 50 个 batch
+  eval_split: "validation"     # 验证集 split
+
 # 数据配置
 data:
   dataset: "RobinChen2001/TinyStories-Zh-2M"
   max_length: 512
-  num_workers: 6               # 预分词数据 IO 轻量，6 worker 够用
+  num_workers: 2               # 减少 worker 数量避免内存爆炸 (每个 worker fork 后占 ~12GB)
   hf_token: ""  # Set via HF_TOKEN environment variable
   cache_dir: "data/raw"

@@ -1,4 +1,4 @@
-.PHONY: install train evaluate ablation visualize test lint format type-check clean
+.PHONY: install train evaluate ablation visualize test lint format type-check clean monitor status create-val-split verify-split monitor-start monitor-stop monitor-status monitor-logs web-monitor
 
 # Conda 环境（CUDA 版 PyTorch）
 CONDA = eval "$$(conda shell.bash hook 2>/dev/null)" && conda activate torch_cuda &&
@@ -11,6 +11,18 @@ install:
 # 训练模型（GPU）
 train:
 	$(CONDA) python scripts/train.py --config configs/hot_42m.yaml
+
+# 训练 8M 模型
+train-hot-8m:
+	$(CONDA) python scripts/train.py --config configs/hot_8m.yaml
+
+# 创建训练/验证集分割
+create-val-split:
+	$(CONDA) python scripts/create_validation_split.py
+
+# 验证数据分割完整性
+verify-split:
+	$(CONDA) python scripts/verify_data_split.py
 
 # 评估模型
 evaluate:
@@ -79,3 +91,53 @@ help:
 	@echo "  train-rope    - Train RoPE 42M baseline"
 	@echo "  evaluate-rope - Evaluate RoPE 42M baseline"
 	@echo "  check         - Run all checks"
+	@echo "  monitor       - Monitor training progress"
+	@echo "  status        - Show project status"
+
+# 监控训练进度
+monitor:
+	$(CONDA) python monitor.py
+
+# 显示项目状态
+status:
+	@bash check_status.sh
+
+# 启动训练监控（前台）
+monitor-run:
+	$(CONDA) python train_monitor.py --config configs/hot_42m.yaml
+
+# 后台启动训练监控
+monitor-start:
+	@echo "启动训练监控（后台）..."
+	@nohup $(CONDA) python train_monitor.py --config configs/hot_42m.yaml > monitor.log 2>&1 &
+	@echo "PID: $$!"
+	@echo "日志: tail -f monitor.log"
+
+# 停止训练监控
+monitor-stop:
+	@echo "停止训练监控..."
+	@pkill -f "train_monitor.py" || echo "未找到监控进程"
+	@pkill -f "scripts/train.py" || echo "未找到训练进程"
+
+# 查看监控状态
+monitor-status:
+	@echo "=== 监控进程状态 ==="
+	@ps aux | grep -E "train_monitor|train.py" | grep -v grep || echo "无监控/训练进程"
+	@echo ""
+	@echo "=== GPU 状态 ==="
+	@nvidia-smi --query-gpu=temperature.gpu,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null || echo "无法获取 GPU 状态"
+	@echo ""
+	@echo "=== 最近日志 ==="
+	@tail -20 monitor.log 2>/dev/null || echo "无监控日志"
+
+# 查看监控日志
+monitor-logs:
+	@tail -f monitor.log
+
+# 启动 Web 监控面板
+web-monitor:
+	@echo "启动 Web 监控面板..."
+	@nohup $(CONDA) python monitor.py --port 8081 > /dev/null 2>&1 &
+	@sleep 2
+	@echo "Web 监控面板已启动: http://localhost:8081"
+	@echo "查看日志: tail -f monitor.log"

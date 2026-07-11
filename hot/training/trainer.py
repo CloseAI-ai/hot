@@ -3,6 +3,7 @@
 """
 
 import os
+import time
 import logging
 import torch
 import torch.nn as nn
@@ -40,12 +41,26 @@ class Trainer:
 
         self.model.to(self.device)
 
+        # 梯度检查点（在 compile 之前设置，让 compile 能看到检查点逻辑）
+        grad_ckpt = train_cfg.get('gradient_checkpointing', False)
+        if grad_ckpt and hasattr(self.model, 'set_gradient_checkpointing'):
+            self.model.set_gradient_checkpointing(True)
+            logger.info("启用梯度检查点（用计算换内存）")
+
         # torch.compile 优化
+        # - default：inductor 优化（内核融合、内存规划），不使用 CUDA Graphs
+        #   （reduce-overhead 的 CUDA Graphs 与 FlexAttention score_mod 闭包不兼容：
+        #     闭包每步捕获新张量，Graphs 回放时地址已变）
+        # - dynamic=True：允许输入形状动态变化，避免因微小变化触发重编译
+        # FlexAttention 的 _flex_attention_call 已用 @allow_in_graph 包装，
+        # dynamo 会将其纳入计算图而非断图
         compile_cfg = train_cfg.get('compile', False)
         if compile_cfg and hasattr(torch, 'compile'):
-            compile_mode = train_cfg.get('compile_mode', 'default')
-            logger.info(f"启用 torch.compile (mode={compile_mode})")
-            self.model = torch.compile(self.model, mode=compile_mode)
+            torch._dynamo.reset()
+            logger.info("启用 torch.compile (mode=default, dynamic=True)")
+            self.model = torch.compile(
+                self.model, mode='default', dynamic=True
+            )
 
         # 优化器和调度器（传入 training 子配置，使用 self.model 以支持 compile）
         self.optimizer = configure_optimizer(self.model, train_cfg)
@@ -91,6 +106,13 @@ class Trainer:
         self.global_step = 0
         self.micro_step = 0
         self.best_loss = float('inf')
+
+        # 吞吐量追踪
+        self._timing_start = None
+        self._timing_steps = 0
+        self._tokens_per_step = int(train_cfg.get('batch_size', 16)) * \
+            int(train_cfg.get('gradient_accumulation', 1)) * \
+            int(config.get('data', {}).get('max_length', 512))
 
     def resume(self, checkpoint_path: str):
         """
@@ -185,6 +207,10 @@ class Trainer:
         # 关闭 tqdm 以消除进度条开销（用日志替代）
         pbar = None
 
+        log_interval = max(self.log_every, 100)
+        self._timing_start = time.time()
+        self._timing_steps = 0
+
         while self.global_step < self.max_steps:
             for batch in train_dataloader:
                 if self.global_step >= self.max_steps:
@@ -196,11 +222,11 @@ class Trainer:
                 # 前向 + 反向（训练时不返回详细信息以节省内存）
                 loss = self._training_step(batch, beta)
 
-                # NaN 检测：跳过此 step 防止 NaN 传播
-                if torch.isnan(loss) or torch.isinf(loss):
+                # NaN 检测：单次 isfinite 检查（一次 GPU-CPU sync）
+                if not torch.isfinite(loss):
                     logger.warning(f"[step {self.global_step}] 检测到 NaN/Inf loss，跳过此 step")
                     self.optimizer.zero_grad(set_to_none=True)
-                    self.micro_step = 0  # 重置梯度累积
+                    self.micro_step = 0
                     continue
 
                 (loss / self.gradient_accumulation).backward()
@@ -216,22 +242,35 @@ class Trainer:
                     self.optimizer.zero_grad(set_to_none=True)
 
                     self.global_step += 1
+                    self._timing_steps += 1
 
-                    # 进度日志（每100步）
-                    if self.global_step % 100 == 0:
+                    # 统一日志（合并原 step%100 和 step%log_every 两个块，减少 GPU-CPU sync）
+                    if self.global_step % log_interval == 0:
+                        loss_val = loss.item()  # 单次 GPU-CPU sync
                         lr = self.optimizer.param_groups[0]['lr']
                         beta_val = self.annealing.get_beta(self.global_step)
-                        logger.info(f"[step {self.global_step}] loss={loss.item():.4f} lr={lr:.6f} beta={beta_val:.6f}")
 
-                    # 详细日志
-                    if self.global_step % self.log_every == 0:
-                        lr = self.optimizer.param_groups[0]['lr']
-                        beta = self.annealing.get_beta(self.global_step)
+                        elapsed = time.time() - self._timing_start
+                        steps_per_sec = self._timing_steps / max(elapsed, 1e-6)
+                        tokens_per_sec = steps_per_sec * self._tokens_per_step
+                        eta_steps = self.max_steps - self.global_step
+                        eta_sec = eta_steps / max(steps_per_sec, 1e-6)
+
+                        logger.info(
+                            f"[step {self.global_step}/{self.max_steps}] "
+                            f"loss={loss_val:.4f} lr={lr:.6f} beta={beta_val:.6f} "
+                            f"| {steps_per_sec:.2f} step/s {tokens_per_sec:.0f} tok/s "
+                            f"ETA {eta_sec/3600:.1f}h"
+                        )
                         self._log_metrics({
-                            'train_loss': loss.item(),
+                            'train_loss': loss_val,
                             'learning_rate': lr,
-                            'annealing_beta': beta,
+                            'annealing_beta': beta_val,
+                            'steps_per_sec': steps_per_sec,
+                            'tokens_per_sec': tokens_per_sec,
                         })
+                        self._timing_start = time.time()
+                        self._timing_steps = 0
 
                     # 评估
                     if (eval_dataloader is not None
@@ -295,7 +334,9 @@ class Trainer:
             logger.info(f"[step {self.global_step}] {', '.join(parts)}")
 
     def _save_checkpoint(self, name: str):
-        """保存检查点（使用原子操作更新 latest.pt）"""
+        """保存检查点（保存一次，latest.pt 通过复制生成，避免双重序列化）"""
+        import shutil
+
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
@@ -307,14 +348,12 @@ class Trainer:
         path = os.path.join(self.save_dir, f'{name}.pt')
         latest_path = os.path.join(self.save_dir, 'latest.pt')
 
-        # 先保存到临时文件，再原子重命名
+        # 保存到临时文件再原子重命名
         tmp_path = path + '.tmp'
         torch.save(checkpoint, tmp_path)
         os.replace(tmp_path, path)
 
-        # 使用原子重命名更新 latest.pt
-        tmp_latest = latest_path + '.tmp'
-        torch.save(checkpoint, tmp_latest)
-        os.replace(tmp_latest, latest_path)
+        # latest.pt 通过复制生成（避免第二次 torch.save 序列化开销）
+        shutil.copy2(path, latest_path)
 
         logger.info(f"检查点已保存: {path} (step={self.global_step})")

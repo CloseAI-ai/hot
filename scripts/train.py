@@ -10,15 +10,22 @@ HOT 训练脚本
 
 import argparse
 import logging
+import os
+import sys
 import yaml
 import torch
 from torch.utils.data import DataLoader
+
+# 进程锁文件，防止重复启动训练
+LOCK_FILE = "train.lock"
 
 # 启用 TF32（RTX 30/40 系列 Tensor Core 加速）
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
+# 设置为 'high' 启用 TF32，'highest' 会禁用 TF32
 torch.set_float32_matmul_precision('high')
+print(f"[INFO] TF32 已启用: allow_tf32={torch.backends.cuda.matmul.allow_tf32}, precision={torch.get_float32_matmul_precision()}")
 
 from hot.model import HOTModel
 from hot.training import Trainer
@@ -78,6 +85,33 @@ def main():
                         help='预分词数据集并保存')
     args = parser.parse_args()
 
+    # 检查进程锁，防止重复启动训练
+    import atexit
+
+    def cleanup_lock():
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+
+    if os.path.exists(LOCK_FILE):
+        with open(LOCK_FILE, 'r') as f:
+            old_pid = f.read().strip()
+        # 检查旧进程是否仍在运行
+        try:
+            os.kill(int(old_pid), 0)
+            print(f"[错误] 训练进程已在运行 (PID: {old_pid})，请勿重复启动！")
+            print(f"如需强制启动，请先删除锁文件: rm {LOCK_FILE}")
+            sys.exit(1)
+        except (ProcessLookupError, ValueError):
+            # 旧进程已不存在，清理锁文件
+            cleanup_lock()
+
+    # 创建锁文件
+    with open(LOCK_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+
+    # 注册退出清理
+    atexit.register(cleanup_lock)
+
     # 加载配置
     config = load_config(args.config)
 
@@ -111,6 +145,9 @@ def main():
         device = torch.device(device_str)
     logging.info(f"设备: {device}")
 
+    # 设置 HF 镜像环境变量（必须在加载分词器/数据集之前）
+    os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
+
     # 分词器
     tokenizer = get_tokenizer()
 
@@ -118,10 +155,6 @@ def main():
     data_cfg = config.get('data', {})
     train_cfg = config.get('training', {})
     max_length = int(data_cfg.get('max_length', 512))
-
-    # 设置 HF 镜像环境变量
-    import os
-    os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
 
     # 预分词模式
     if args.pretokenize:
@@ -141,32 +174,88 @@ def main():
     # 检查是否有预分词数据
     pretokenized_path = f"data/tokenized/train_{max_length}"
 
-    train_dataset = HOTDataset(
-        dataset_name=data_cfg.get('dataset', 'RobinChen2001/TinyStories-Zh-2M'),
-        tokenizer=tokenizer,
-        max_length=max_length,
-        split='train',
-        hf_token=data_cfg.get('hf_token'),
-        cache_dir=data_cfg.get('cache_dir'),
-        pretokenized_path=pretokenized_path if os.path.exists(pretokenized_path) else None,
-    )
+    # 检查是否有预分割的训练/验证集
+    splits_dir = "data/splits"
+    train_split_path = os.path.join(splits_dir, "train")
+    val_split_path = os.path.join(splits_dir, "val")
+
+    if os.path.exists(train_split_path) and os.path.exists(val_split_path):
+        # 使用预分割的数据集（行业规范：确保验证集一致性）
+        logging.info("使用预分割的训练/验证集")
+        train_dataset = HOTDataset(
+            dataset_name=data_cfg.get('dataset', 'RobinChen2001/TinyStories-Zh-2M'),
+            tokenizer=tokenizer,
+            max_length=max_length,
+            split='train',
+            hf_token=data_cfg.get('hf_token'),
+            cache_dir=data_cfg.get('cache_dir'),
+            pretokenized_path=train_split_path,
+        )
+        eval_dataset = HOTDataset(
+            dataset_name=data_cfg.get('dataset', 'RobinChen2001/TinyStories-Zh-2M'),
+            tokenizer=tokenizer,
+            max_length=max_length,
+            split='train',
+            hf_token=data_cfg.get('hf_token'),
+            cache_dir=data_cfg.get('cache_dir'),
+            pretokenized_path=val_split_path,
+        )
+    else:
+        # 回退：从完整训练集切分（不推荐，每次运行可能不同）
+        logging.warning("未找到预分割数据集，从完整训练集切分验证集")
+        logging.warning("建议运行: python scripts/create_validation_split.py")
+
+        train_dataset = HOTDataset(
+            dataset_name=data_cfg.get('dataset', 'RobinChen2001/TinyStories-Zh-2M'),
+            tokenizer=tokenizer,
+            max_length=max_length,
+            split='train',
+            hf_token=data_cfg.get('hf_token'),
+            cache_dir=data_cfg.get('cache_dir'),
+            pretokenized_path=pretokenized_path if os.path.exists(pretokenized_path) else None,
+        )
+
+        # 验证集：从训练集随机切分 10%
+        eval_ratio = 0.1
+        total_len = len(train_dataset)
+        eval_len = int(total_len * eval_ratio)
+        train_len = total_len - eval_len
+        train_dataset, eval_dataset = torch.utils.data.random_split(
+            train_dataset, [train_len, eval_len],
+            generator=torch.Generator().manual_seed(42)
+        )
+
+    logging.info(f"数据集: 训练 {len(train_dataset):,} 样本, 验证 {len(eval_dataset):,} 样本")
 
     collator = DataCollator(pad_token_id=tokenizer.pad_token_id)
 
-    # DataLoader 优化：预分词数据用 num_workers=0 避免 IPC 开销
-    num_workers = data_cfg.get('num_workers', 4)
-    use_pretokenized = os.path.exists(pretokenized_path)
-    dl_workers = 0 if use_pretokenized else num_workers
+    # DataLoader 优化：预分词数据也使用异步加载以重叠 GPU 计算
+    num_workers = data_cfg.get('num_workers', 2)
+    use_cuda = 'cuda' in str(device)
+    # 限制 worker 数量避免内存爆炸 (每个 fork worker 继承父进程内存空间)
+    dl_workers = min(num_workers, 2) if use_cuda else 0
+    bs = int(train_cfg.get('batch_size', 16))
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=int(train_cfg.get('batch_size', 16)),
+        batch_size=bs,
         shuffle=True,
         collate_fn=collator,
         num_workers=dl_workers,
-        pin_memory=dl_workers > 0,
+        pin_memory=use_cuda,
         drop_last=True,
         persistent_workers=dl_workers > 0,
-        prefetch_factor=4 if dl_workers > 0 else None,
+        prefetch_factor=2 if dl_workers > 0 else None,
+    )
+    eval_dataloader = DataLoader(
+        eval_dataset,
+        batch_size=bs,
+        shuffle=False,
+        collate_fn=collator,
+        num_workers=dl_workers,
+        pin_memory=use_cuda,
+        drop_last=False,
+        persistent_workers=dl_workers > 0,
+        prefetch_factor=2 if dl_workers > 0 else None,
     )
 
     # 模型
@@ -184,7 +273,7 @@ def main():
 
     # 训练
     logging.info("开始训练...")
-    trainer.train(train_dataloader)
+    trainer.train(train_dataloader, eval_dataloader)
     logging.info("训练完成!")
 
 

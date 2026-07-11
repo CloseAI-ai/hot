@@ -6,14 +6,19 @@ HOT 模型模块
 优化：
 - 预计算 sin/cos(theta) 一次，所有层共享
 - 预计算 position 索引，注册为 buffer
+- 预计算因果 mask（布尔矩阵），所有层共享
+- FlexAttention block mask 缓存（按序列长度）
+- 梯度检查点：用计算换内存，允许更大 batch
+- 分块交叉熵：避免实体化 [B,N,V] logits 张量
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from typing import Dict, Optional
 
-from .hot_layer import HOTLayer, RMSNorm
+from .hot_layer import HOTLayer, RMSNorm, _FLEX_ATTENTION_AVAILABLE
 
 
 class Config:
@@ -71,6 +76,49 @@ class HOTModel(nn.Module):
         self.register_buffer('_pos_buf', torch.arange(1, 513, dtype=torch.float32),
                              persistent=False)
 
+        # 预计算因果 mask 布尔矩阵（所有层共享，避免每层每步重建）
+        self.register_buffer('_causal_mask', torch.triu(
+            torch.ones(512, 512, dtype=torch.bool), diagonal=1
+        ), persistent=False)
+
+        # FlexAttention block mask 缓存（按序列长度 N 缓存）
+        self._flex_block_masks = {}
+        self._flex_available = _FLEX_ATTENTION_AVAILABLE
+
+        # 梯度检查点（由 Trainer 设置）
+        self._use_grad_checkpoint = False
+
+    def set_gradient_checkpointing(self, enabled: bool):
+        """启用/禁用梯度检查点"""
+        self._use_grad_checkpoint = enabled
+
+    @staticmethod
+    def _chunked_cross_entropy(hidden: torch.Tensor, weight: torch.Tensor,
+                                labels: torch.Tensor, chunk_size: int = 4096) -> torch.Tensor:
+        """
+        分块交叉熵：避免实体化 [B*N, V] logits 张量
+
+        Args:
+            hidden: [B*N, D] 隐藏状态
+            weight: [V, D] LM head 权重（与 embedding 共享）
+            labels: [B*N] 标签
+            chunk_size: 每块处理的 token 数
+        Returns:
+            loss: 标量损失
+        """
+        total_tokens = hidden.shape[0]
+        total_loss = hidden.new_zeros(())
+
+        for i in range(0, total_tokens, chunk_size):
+            end = min(i + chunk_size, total_tokens)
+            chunk_logits = F.linear(hidden[i:end], weight)
+            chunk_loss = F.cross_entropy(
+                chunk_logits, labels[i:end], reduction='sum'
+            )
+            total_loss = total_loss + chunk_loss
+
+        return total_loss / total_tokens
+
     def forward(self, input_ids: torch.Tensor,
                 labels: torch.Tensor = None,
                 beta: float = 1.0,
@@ -91,11 +139,37 @@ class HOTModel(nn.Module):
         B, N = input_ids.shape
         H = self.config.model.num_heads
 
-        # 初始化相位：θ_init 广播到 [B, H, N]
-        theta = self.theta_init.expand(B, H, N).contiguous()
+        # 初始化相位：theta_init 广播到 [B, H, N]
+        # 使用 expand（视图，不拷贝）而非 expand().contiguous()（拷贝）
+        # 后续 phase_dynamics 的加法会自然产生新的连续张量
+        theta = self.theta_init.expand(B, H, N)
 
         # 位置索引（从预注册 buffer 截取）
         pos = self._pos_buf[:N].to(dtype=theta.dtype)
+
+        # 因果 mask（所有层共享同一份）
+        causal_mask = self._causal_mask[:N, :N]
+
+        # FlexAttention block mask（按 N 缓存，避免重复创建）
+        # 仅在 CUDA + 非梯度检查点模式下使用 FlexAttention
+        # （梯度检查点与 FlexAttention 在 PyTorch 2.13 存在兼容性问题）
+        if self._flex_available and input_ids.is_cuda and not self._use_grad_checkpoint:
+            if N not in self._flex_block_masks:
+                from torch.nn.attention.flex_attention import create_block_mask
+
+                def causal_mask_fn(b, h, q_idx, kv_idx):
+                    return q_idx >= kv_idx
+
+                self._flex_block_masks[N] = create_block_mask(
+                    causal_mask_fn, B=None, H=None,
+                    Q_LEN=N, KV_LEN=N,
+                    device=input_ids.device,
+                )
+            # 设为层属性而非函数参数，让 dynamo 将 BlockMask 视为
+            # 模块常量，避免 graph break
+            flex_bm = self._flex_block_masks[N]
+            for layer in self.layers:
+                layer._flex_block_mask = flex_bm
 
         x = self.embed(input_ids)
 
@@ -104,18 +178,39 @@ class HOTModel(nn.Module):
             all_attentions = []
 
         for layer in self.layers:
-            x, theta, attn_weights = layer(x, theta, beta, pos)
+            if self._use_grad_checkpoint and self.training and not return_details:
+                x, theta, _ = grad_checkpoint(
+                    layer, x, theta, beta, pos, causal_mask,
+                    use_reentrant=False,
+                )
+            else:
+                x, theta, attn_weights = layer(
+                    x, theta, beta, pos, causal_mask
+                )
 
             if return_details:
                 all_thetas.append(theta)
                 all_attentions.append(attn_weights)
 
         x = self.norm(x)
-        logits = self.lm_head(x)
 
         loss = None
         if labels is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
+            if self.training:
+                # 分块交叉熵：避免实体化 [B*N, V] logits（省 ~400MB+ 显存）
+                x_flat = x.reshape(-1, x.shape[-1])
+                labels_flat = labels.reshape(-1)
+                loss = self._chunked_cross_entropy(
+                    x_flat, self.lm_head.weight, labels_flat
+                )
+                logits = None  # 训练时不保留 logits 以节省内存
+            else:
+                logits = self.lm_head(x)
+                loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)), labels.view(-1)
+                )
+        else:
+            logits = self.lm_head(x)
 
         result = {
             'logits': logits,

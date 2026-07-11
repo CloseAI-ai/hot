@@ -1,0 +1,8 @@
+name = "hot-monitor"
+compatibility_date = "2024-01-01"
+pages_build_output_dir = "./public"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "hot-training-db"
+database_id = "4636e359-0a9e-45ff-ad89-a4a0a2d9c649"

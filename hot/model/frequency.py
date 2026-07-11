@@ -40,23 +40,9 @@ class IntrinsicFrequency(nn.Module):
         Returns:
             omega: [B, H, N] 固有频率，范围 (-1, 1)
         """
-        # ||Q_i||² - ||K_i||²，沿 head_dim 维度求和（保留 head 维度）
-        # Q.pow(2) - K.pow(2): [B, H, N, d]
-        # .sum(dim=-1): [B, H, N] — 每个 head 独立的能量差
         energy_diff = (Q.pow(2) - K.pow(2)).sum(dim=-1)  # [B, H, N]
 
-        # 投影到频率：[B, H, N] → [B, H, N, 1] → proj → [B, H, N, H_out]
-        # 但我们需要每头独立的频率，所以用逐元素方式
-        omega = torch.tanh(self.proj(energy_diff.unsqueeze(-1)))  # [B, H, N, num_heads]
-
-        # 提取每头对应的频率：omega[:, h, :, h] → [B, N] per head
-        # 更简洁的方式：直接用 energy_diff 作为输入
-        # 由于 proj 是 Linear(1, num_heads)，每个 head 的输出是 weight[h] * input + bias[h]
-        # 我们需要 [B, H, N] 输出，但 proj 输出是 [B, H, N, num_heads]
-
-        # 方案：直接返回 energy_diff 经过 tanh 缩放
-        # 这样每头有独立的能量差信号
-        alpha = self.proj.weight.mean()  # 标量缩放因子
-        beta = self.proj.bias.mean()     # 标量偏置
+        alpha = self.proj.weight.mean()
+        beta = self.proj.bias.mean()
 
         return torch.tanh(alpha * energy_diff + beta)

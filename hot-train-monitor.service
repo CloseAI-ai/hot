@@ -1,0 +1,24 @@
+[Unit]
+Description=HOT Training Monitor
+After=network.target
+
+[Service]
+Type=simple
+User=dev
+WorkingDirectory=/home/dev/projects/ai/hot
+ExecStart=/home/dev/miniconda3/envs/torch_cuda/bin/python train_monitor.py --config configs/hot_42m.yaml
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/home/dev/projects/ai/hot/monitor.log
+StandardError=append:/home/dev/projects/ai/hot/monitor.log
+
+# 环境变量
+Environment=HF_ENDPOINT=https://hf-mirror.com
+Environment=CUDA_VISIBLE_DEVICES=0
+
+# 资源限制
+MemoryMax=16G
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target
