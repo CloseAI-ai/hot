@@ -17,6 +17,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from typing import Dict, Optional
+import logging
+
+logger = logging.getLogger(__name__)
 
 from .hot_layer import HOTLayer, RMSNorm, _FLEX_ATTENTION_AVAILABLE
 
@@ -170,6 +173,10 @@ class HOTModel(nn.Module):
             flex_bm = self._flex_block_masks[N]
             for layer in self.layers:
                 layer._flex_block_mask = flex_bm
+            # 调试日志（仅首次）
+            if not hasattr(self, '_flex_logged'):
+                logger.info(f"FlexAttention 已启用: N={N}, block_mask={flex_bm}")
+                self._flex_logged = True
 
         x = self.embed(input_ids)
 

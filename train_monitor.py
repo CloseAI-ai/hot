@@ -192,7 +192,7 @@ class TrainMonitor:
         except Exception as e:
             logger.warning(f"清理检查点失败: {e}")
 
-    def start_training(self):
+    def start_training(self, resume_from=None):
         """启动训练进程"""
         # 使用 conda run 确保正确的环境
         cmd = [
@@ -200,6 +200,11 @@ class TrainMonitor:
             "python", "scripts/train.py",
             "--config", self.config_path,
         ]
+
+        # 如果有检查点，添加 resume参数
+        if resume_from and os.path.exists(resume_from):
+            cmd.extend(["--resume", resume_from])
+            logger.info(f"从检查点恢复: {resume_from}")
 
         logger.info(f"启动训练: retry={self.retry_count}")
         logger.info(f"命令: {' '.join(cmd)}")
@@ -340,8 +345,19 @@ class TrainMonitor:
         logger.info(f"磁盘限制: {self.min_disk_gb} GB")
         logger.info("=" * 60)
 
+        # 查找最新检查点
+        latest_checkpoint = None
+        checkpoint_dir = "checkpoints"
+        if os.path.exists(checkpoint_dir):
+            checkpoints = [f for f in os.listdir(checkpoint_dir) if f.startswith("step_") and f.endswith(".pt")]
+            if checkpoints:
+                # 按步数排序，取最新的
+                checkpoints.sort(key=lambda x: int(x.split("_")[1].split(".")[0]))
+                latest_checkpoint = os.path.join(checkpoint_dir, checkpoints[-1])
+                logger.info(f"找到检查点: {latest_checkpoint}")
+
         # 首次启动
-        if not self.start_training():
+        if not self.start_training(resume_from=latest_checkpoint):
             logger.error("首次启动训练失败")
             return
 
