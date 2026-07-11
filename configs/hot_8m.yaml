@@ -41,7 +41,7 @@ training:
   weight_decay: 0.01            # 权重衰减 (AdamW黄金默认值，原0.1过高)
   max_grad_norm: 1.0            # 梯度裁剪 (防止梯度爆炸)
   precision: "bf16"             # 训练精度
-  compile: true                 # 启用 torch.compile
+  compile: true                 # 启用 torch.compile (FlexAttention 需要)
   compile_mode: "default"       # 编译模式
   gradient_checkpointing: false # 梯度检查点与 FlexAttention 不兼容
 

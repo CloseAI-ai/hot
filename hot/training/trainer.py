@@ -128,7 +128,29 @@ class Trainer:
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
         # 恢复模型参数
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        # 处理 torch.compile 与非 compile 模式之间的检查点兼容性
+        state_dict = checkpoint['model_state_dict']
+        ckpt_has_prefix = any(k.startswith('_orig_mod.') for k in state_dict.keys())
+        model_is_compiled = hasattr(self.model, '_orig_mod')
+
+        if ckpt_has_prefix and not model_is_compiled:
+            # 检查点是 compile 格式，当前模型不是 compile → 去掉前缀
+            logger.info("检查点为 torch.compile 格式，转换为标准格式...")
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                new_key = k[len('_orig_mod.'):] if k.startswith('_orig_mod.') else k
+                new_state_dict[new_key] = v
+            state_dict = new_state_dict
+        elif not ckpt_has_prefix and model_is_compiled:
+            # 检查点是标准格式，当前模型是 compile → 添加前缀
+            logger.info("检查点为标准格式，转换为 torch.compile 格式...")
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                new_state_dict[f'_orig_mod.{k}'] = v
+            state_dict = new_state_dict
+        # 否则：格式一致，直接加载
+
+        self.model.load_state_dict(state_dict)
 
         # 恢复优化器状态（如果存在）
         if 'optimizer_state_dict' in checkpoint:

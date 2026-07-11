@@ -173,10 +173,7 @@ class HOTModel(nn.Module):
             flex_bm = self._flex_block_masks[N]
             for layer in self.layers:
                 layer._flex_block_mask = flex_bm
-            # 调试日志（仅首次）
-            if not hasattr(self, '_flex_logged'):
-                logger.info(f"FlexAttention 已启用: N={N}, block_mask={flex_bm}")
-                self._flex_logged = True
+            # FlexAttention 已启用（不打印 BlockMask 对象，避免 torch.compile 兼容性问题）
 
         x = self.embed(input_ids)
 
